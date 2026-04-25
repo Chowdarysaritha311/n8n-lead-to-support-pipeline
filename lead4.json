@@ -1,0 +1,9 @@
+{
+  "_meta": { "scenario": "SPAM — keyword match + suspicious domain" },
+  "name": "John Smith",
+  "email": "winner123@mailinator.com",
+  "company": "Get Rich LLC",
+  "message": "Buy now and make money fast! Free money guaranteed! Act now before this limited time offer expires. No risk investment opportunity!",
+  "urgency": "normal",
+  "product": "Analytics"
+}

@@ -1,0 +1,831 @@
+{
+  "name": "Lead-to-Support Intelligent Automation Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-trigger",
+      "name": "🔗 Webhook: Lead Intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "description": "Entry point. Accepts POST /lead-intake. Fast-ack pattern: response is sent immediately via Respond to Webhook node, processing continues async."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"accepted\", \"message\": \"Lead received and queued for processing\", \"timestamp\": \"{{ $now.toISO() }}\" }",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "node-ack-response",
+      "name": "✅ ACK: Immediate 202 Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 260],
+      "description": "Returns HTTP 202 immediately so the caller is not blocked. Pipeline continues processing asynchronously."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// STAGE 1: VALIDATION + SPAM DETECTION\n// ============================================================\nconst payload = $input.first().json.body || $input.first().json;\n\nconst SPAM_KEYWORDS = [\n  'buy now', 'free money', 'click here', 'make money fast',\n  'guaranteed', 'no risk', 'act now', 'limited time offer',\n  'winner', 'congratulations', 'claim your prize'\n];\n\nconst SUSPICIOUS_DOMAINS = [\n  'mailinator.com', 'guerrillamail.com', 'tempmail.com',\n  'throwaway.email', 'yopmail.com', 'sharklasers.com'\n];\n\nconst errors = [];\nconst spamFlags = [];\nlet spamScore = 0;\n\n// --- Required field validation ---\nif (!payload.name || payload.name.trim().length < 2) {\n  errors.push('MISSING_OR_INVALID_NAME');\n}\nif (!payload.email) {\n  errors.push('MISSING_EMAIL');\n}\nif (!payload.message) {\n  errors.push('MISSING_MESSAGE');\n}\nif (!payload.product) {\n  errors.push('MISSING_PRODUCT');\n}\nif (!payload.urgency || !['high', 'normal'].includes(payload.urgency)) {\n  errors.push('INVALID_URGENCY_MUST_BE_high_OR_normal');\n}\n\n// --- Email format validation ---\nif (payload.email) {\n  const emailRegex = /^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$/;\n  if (!emailRegex.test(payload.email)) {\n    errors.push('INVALID_EMAIL_FORMAT');\n  }\n}\n\n// --- Message length threshold ---\nif (payload.message && payload.message.trim().length < 10) {\n  errors.push('MESSAGE_TOO_SHORT_MIN_10_CHARS');\n}\n\n// --- Spam: keyword detection ---\nconst messageLower = (payload.message || '').toLowerCase();\nconst nameLower = (payload.name || '').toLowerCase();\nfor (const kw of SPAM_KEYWORDS) {\n  if (messageLower.includes(kw) || nameLower.includes(kw)) {\n    spamFlags.push(`keyword:${kw}`);\n    spamScore += 25;\n  }\n}\n\n// --- Spam: repeated characters (e.g. 'aaaaaaa') ---\nif (/(.)(\\1{4,})/.test(payload.message || '')) {\n  spamFlags.push('repeated_chars');\n  spamScore += 20;\n}\n\n// --- Spam: all-caps message ---\nif (payload.message && payload.message.length > 10 && payload.message === payload.message.toUpperCase()) {\n  spamFlags.push('all_caps_message');\n  spamScore += 15;\n}\n\n// --- Spam: suspicious domain ---\nif (payload.email) {\n  const domain = payload.email.split('@')[1]?.toLowerCase();\n  if (SUSPICIOUS_DOMAINS.includes(domain)) {\n    spamFlags.push(`suspicious_domain:${domain}`);\n    spamScore += 50;\n  }\n}\n\n// --- Spam: email local-part is purely numeric ---\nif (payload.email) {\n  const localPart = payload.email.split('@')[0];\n  if (/^\\d+$/.test(localPart)) {\n    spamFlags.push('numeric_email_local_part');\n    spamScore += 10;\n  }\n}\n\nconst isSpam = spamScore >= 50;\nconst isValid = errors.length === 0 && !isSpam;\n\nreturn [{\n  json: {\n    ...payload,\n    _validation: {\n      isValid,\n      isSpam,\n      spamScore,\n      spamFlags,\n      errors,\n      stage: 'VALIDATION'\n    }\n  }\n}];"
+      },
+      "id": "node-validation",
+      "name": "🛡️ Validate + Spam Filter",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 400],
+      "description": "Validates required fields, email format, message length. Computes spam score from keyword matching, repeated chars, suspicious domains. Score ≥50 = spam."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json._validation.isValid }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-valid-check",
+      "name": "🔀 Route: Valid or Dead-Letter?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "description": "Branches: TRUE → valid lead continues pipeline | FALSE → dead-letter flow"
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// STAGE 2: IDEMPOTENCY CHECK\n// ============================================================\n// Hash = SHA-256 of (email + message + product)\n// This ensures replaying the exact same payload N times\n// results in exactly 1 stored record.\n\nconst crypto = require('crypto');\nconst item = $input.first().json;\n\nconst rawKey = `${(item.email || '').toLowerCase().trim()}|${(item.message || '').trim()}|${(item.product || '').trim()}`;\nconst idempotencyKey = crypto.createHash('sha256').update(rawKey).digest('hex');\n\nreturn [{\n  json: {\n    ...item,\n    _idempotencyKey: idempotencyKey,\n    _rawKey: rawKey\n  }\n}];"
+      },
+      "id": "node-hash-gen",
+      "name": "🔑 Generate Idempotency Hash",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 360],
+      "description": "Computes SHA-256(email|message|product). This idempotency key is used to prevent duplicate processing. Same payload = same hash = skip."
+    },
+    {
+      "parameters": {
+        "operation": "lookup",
+        "documentId": "={{ $env.GOOGLE_SHEET_ID }}",
+        "sheetName": "Leads",
+        "lookupColumn": "idempotency_key",
+        "lookupValue": "={{ $json._idempotencyKey }}"
+      },
+      "id": "node-idempotency-lookup",
+      "name": "🔍 Check: Already Processed? (Sheets Lookup)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [1120, 360],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "description": "Looks up the idempotency key in the Leads sheet. If found → duplicate. If not found → new lead."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.idempotency_key }}",
+              "value2": "",
+              "operation": "equal"
+            }
+          ]
+        }
+      },
+      "id": "node-duplicate-check",
+      "name": "🔀 Route: New Lead or Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1340, 360],
+      "description": "TRUE = idempotency_key not found = new lead → continue | FALSE = duplicate found → skip and log"
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// DUPLICATE IGNORED — LOG AND TERMINATE BRANCH\n// ============================================================\nconst item = $input.first().json;\n\nconsole.log(JSON.stringify({\n  event: 'DUPLICATE_IGNORED',\n  idempotencyKey: item._idempotencyKey,\n  email: item.email,\n  product: item.product,\n  timestamp: new Date().toISOString()\n}));\n\nreturn [{\n  json: {\n    status: 'DUPLICATE_IGNORED',\n    idempotencyKey: item._idempotencyKey,\n    email: item.email,\n    message: 'Payload already processed. Skipped to preserve idempotency.'\n  }\n}];"
+      },
+      "id": "node-duplicate-log",
+      "name": "📋 Log: Duplicate Ignored",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 260],
+      "description": "Structured log of the duplicate event. Pipeline terminates here. No record is written. Idempotency guarantee is preserved."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// STAGE 3: DATA ENRICHMENT + PRIORITY SCORING\n// ============================================================\nconst item = $input.first().json;\n\n// --- Company inference from email domain ---\nlet company = item.company || '';\nlet inferredCompany = false;\n\nif (!company && item.email) {\n  const domain = item.email.split('@')[1]?.toLowerCase();\n  const KNOWN_DOMAINS = {\n    'google.com': 'Google',\n    'microsoft.com': 'Microsoft',\n    'amazon.com': 'Amazon',\n    'apple.com': 'Apple',\n    'meta.com': 'Meta',\n    'salesforce.com': 'Salesforce',\n    'stripe.com': 'Stripe',\n    'shopify.com': 'Shopify',\n    'netflix.com': 'Netflix',\n    'uber.com': 'Uber'\n  };\n  const FREE_EMAIL_DOMAINS = [\n    'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com',\n    'icloud.com', 'protonmail.com', 'aol.com'\n  ];\n\n  if (KNOWN_DOMAINS[domain]) {\n    company = KNOWN_DOMAINS[domain];\n    inferredCompany = true;\n  } else if (!FREE_EMAIL_DOMAINS.includes(domain)) {\n    // Capitalize domain as company name heuristic\n    company = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);\n    inferredCompany = true;\n  } else {\n    company = 'Individual / Unknown';\n  }\n}\n\n// --- Priority score calculation ---\nlet priorityScore = 0;\nconst priorityFactors = [];\n\n// Urgency\nif (item.urgency === 'high') {\n  priorityScore += 40;\n  priorityFactors.push('urgency:high(+40)');\n} else {\n  priorityScore += 10;\n  priorityFactors.push('urgency:normal(+10)');\n}\n\n// High-intent keywords in message\nconst HIGH_INTENT_KW = ['urgent', 'asap', 'critical', 'down', 'broken', 'production', 'outage', 'blocked', 'emergency'];\nconst messageLower = (item.message || '').toLowerCase();\nfor (const kw of HIGH_INTENT_KW) {\n  if (messageLower.includes(kw)) {\n    priorityScore += 15;\n    priorityFactors.push(`keyword:${kw}(+15)`);\n    break;\n  }\n}\n\n// Known enterprise company\nconst ENTERPRISE_COS = ['Google', 'Microsoft', 'Amazon', 'Apple', 'Meta', 'Salesforce'];\nif (ENTERPRISE_COS.includes(company)) {\n  priorityScore += 20;\n  priorityFactors.push('enterprise_company(+20)');\n}\n\n// Message length as engagement signal\nif ((item.message || '').length > 200) {\n  priorityScore += 10;\n  priorityFactors.push('detailed_message(+10)');\n}\n\n// --- Classification tags ---\nconst tags = [];\nif (item.urgency === 'high') tags.push('HIGH_URGENCY');\nif (priorityScore >= 60) tags.push('HOT_LEAD');\nif (inferredCompany) tags.push('INFERRED_COMPANY');\nif (company === 'Individual / Unknown') tags.push('PERSONAL_EMAIL');\nif ((item.message || '').length > 300) tags.push('DETAILED_INQUIRY');\nif (HIGH_INTENT_KW.some(kw => messageLower.includes(kw))) tags.push('SUPPORT_CRITICAL');\n\nconst enriched = {\n  ...item,\n  company,\n  _enrichment: {\n    inferredCompany,\n    emailDomain: item.email?.split('@')[1] || null,\n    priorityScore: Math.min(priorityScore, 100),\n    priorityFactors,\n    tags,\n    leadSource: 'webhook_intake',\n    processedAt: new Date().toISOString(),\n    stage: 'ENRICHMENT'\n  }\n};\n\nreturn [{ json: enriched }];"
+      },
+      "id": "node-enrichment",
+      "name": "🧠 Enrich: Company + Priority Score + Tags",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 400],
+      "description": "Infers company from email domain (known mappings + heuristic). Computes priority score (0-100) from urgency, keywords, company tier, message depth. Assigns classification tags."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// STAGE 4: STRUCTURED OBSERVABILITY LOG\n// ============================================================\nconst item = $input.first().json;\n\nconst logEntry = {\n  event: 'LEAD_ENRICHED',\n  timestamp: new Date().toISOString(),\n  idempotencyKey: item._idempotencyKey,\n  email: item.email,\n  name: item.name,\n  company: item.company,\n  product: item.product,\n  urgency: item.urgency,\n  priorityScore: item._enrichment.priorityScore,\n  tags: item._enrichment.tags,\n  stage: 'POST_ENRICHMENT'\n};\n\nconsole.log(JSON.stringify(logEntry));\n\nreturn $input.all();"
+      },
+      "id": "node-log-enrichment",
+      "name": "📊 Log: Enrichment Observability",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1780, 400],
+      "description": "Emits a structured JSON log entry after enrichment. Enables log aggregation (Datadog, CloudWatch, Loki) for observability dashboards."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $env.GOOGLE_SHEET_ID }}",
+        "sheetName": "Leads",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "idempotency_key": "={{ $json._idempotencyKey }}",
+            "name": "={{ $json.name }}",
+            "email": "={{ $json.email }}",
+            "company": "={{ $json.company }}",
+            "message": "={{ $json.message }}",
+            "urgency": "={{ $json.urgency }}",
+            "product": "={{ $json.product }}",
+            "priority_score": "={{ $json._enrichment.priorityScore }}",
+            "tags": "={{ $json._enrichment.tags.join(',') }}",
+            "lead_source": "={{ $json._enrichment.leadSource }}",
+            "inferred_company": "={{ $json._enrichment.inferredCompany }}",
+            "email_domain": "={{ $json._enrichment.emailDomain }}",
+            "status": "new",
+            "processed_at": "={{ $json._enrichment.processedAt }}",
+            "spam_score": "={{ $json._validation.spamScore }}",
+            "spam_flags": "={{ $json._validation.spamFlags.join(',') }}"
+          }
+        }
+      },
+      "id": "node-storage",
+      "name": "💾 Store: Google Sheets — Leads",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [2000, 400],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "description": "Persists lead with all enriched fields, idempotency key, status, and metadata to the Leads sheet."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.urgency }}",
+              "value2": "high",
+              "operation": "equal"
+            }
+          ]
+        }
+      },
+      "id": "node-urgency-route",
+      "name": "🔀 Route: High Urgency or Normal?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2220, 400],
+      "description": "TRUE = urgency:high → Slack alert + Jira ticket | FALSE = normal → email confirmation"
+    },
+    {
+      "parameters": {
+        "webhookUri": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "text": "",
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "header",
+              "text": {
+                "type": "plain_text",
+                "text": "🚨 HIGH URGENCY LEAD — Immediate Action Required"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {
+                  "type": "mrkdwn",
+                  "text": "*Name:*\n{{ $json.name }}"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*Email:*\n{{ $json.email }}"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*Company:*\n{{ $json.company }}"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*Product:*\n{{ $json.product }}"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*Priority Score:*\n{{ $json._enrichment.priorityScore }}/100"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*Tags:*\n{{ $json._enrichment.tags.join(', ') }}"
+                }
+              ]
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*Message:*\n{{ $json.message }}"
+              }
+            },
+            {
+              "type": "context",
+              "elements": [
+                {
+                  "type": "mrkdwn",
+                  "text": "Idempotency Key: `{{ $json._idempotencyKey }}`  |  Received: {{ $json._enrichment.processedAt }}"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "id": "node-slack-high",
+      "name": "📢 Slack: High Urgency Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2440, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Slack Webhook"
+        }
+      },
+      "description": "Sends structured Block Kit Slack alert to the support channel for high-urgency leads. Includes all key fields and idempotency key."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": []
+        },
+        "jsonBody": "={\n  \"fields\": {\n    \"project\": { \"key\": \"{{ $env.JIRA_PROJECT_KEY }}\" },\n    \"summary\": \"[HIGH] Lead from {{ $json.name }} ({{ $json.company }}) — {{ $json.product }}\",\n    \"description\": {\n      \"type\": \"doc\",\n      \"version\": 1,\n      \"content\": [\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Name: {{ $json.name }}\" }]\n        },\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Email: {{ $json.email }}\" }]\n        },\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Company: {{ $json.company }}\" }]\n        },\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Product: {{ $json.product }}\" }]\n        },\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Message: {{ $json.message }}\" }]\n        },\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Priority Score: {{ $json._enrichment.priorityScore }}/100\" }]\n        },\n        {\n          \"type\": \"paragraph\",\n          \"content\": [{ \"type\": \"text\", \"text\": \"Idempotency Key: {{ $json._idempotencyKey }}\" }]\n        }\n      ]\n    },\n    \"issuetype\": { \"name\": \"Bug\" },\n    \"priority\": { \"name\": \"Highest\" },\n    \"labels\": {{ $json._enrichment.tags }}\n  }\n}"
+      },
+      "id": "node-jira",
+      "name": "🎫 Jira: Create High-Priority Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2660, 300],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Jira Basic Auth"
+        }
+      },
+      "description": "Creates a Jira issue via REST API with full lead details, priority score, and enrichment tags. Requires JIRA_BASE_URL and JIRA_PROJECT_KEY env vars."
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "subject": "We received your inquiry — {{ $json.product }}",
+        "emailType": "html",
+        "message": "=<html>\n<body style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;\">\n  <h2 style=\"color: #2563eb;\">Thanks for reaching out, {{ $json.name }}!</h2>\n  <p>We've received your inquiry about <strong>{{ $json.product }}</strong> and our team will review it shortly.</p>\n  <table style=\"border-collapse: collapse; width: 100%; margin: 20px 0;\">\n    <tr style=\"background: #f3f4f6;\">\n      <td style=\"padding: 8px 12px; font-weight: bold;\">Reference ID</td>\n      <td style=\"padding: 8px 12px; font-family: monospace; font-size: 12px;\">{{ $json._idempotencyKey.substring(0, 16) }}...</td>\n    </tr>\n    <tr>\n      <td style=\"padding: 8px 12px; font-weight: bold;\">Product</td>\n      <td style=\"padding: 8px 12px;\">{{ $json.product }}</td>\n    </tr>\n    <tr style=\"background: #f3f4f6;\">\n      <td style=\"padding: 8px 12px; font-weight: bold;\">Submitted</td>\n      <td style=\"padding: 8px 12px;\">{{ $json._enrichment.processedAt }}</td>\n    </tr>\n  </table>\n  <p>Expected response time: <strong>1-2 business days</strong></p>\n  <p style=\"color: #6b7280; font-size: 12px;\">Please keep your reference ID for tracking purposes.</p>\n</body>\n</html>",
+        "options": {}
+      },
+      "id": "node-email-normal",
+      "name": "📧 Email: Confirmation (Normal Urgency)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [2440, 500],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      },
+      "description": "Sends a formatted HTML confirmation email for normal-urgency leads. Includes reference ID (first 16 chars of idempotency hash)."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": "={{ $env.GOOGLE_SHEET_ID }}",
+        "sheetName": "Leads",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "idempotency_key": "={{ $json._idempotencyKey }}",
+            "status": "acknowledged"
+          }
+        },
+        "options": {
+          "lookupColumn": "idempotency_key"
+        }
+      },
+      "id": "node-status-update",
+      "name": "✏️ Update Status: acknowledged",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [2660, 500],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "description": "Updates the record's status to 'acknowledged' after confirmation email is sent."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// AUDIT TRAIL ENTRY\n// ============================================================\nconst item = $input.first().json;\n\nconst auditEntry = {\n  idempotencyKey: item._idempotencyKey,\n  email: item.email,\n  event: item.urgency === 'high' ? 'HIGH_URGENCY_ROUTED' : 'NORMAL_ACKNOWLEDGED',\n  priorityScore: item._enrichment?.priorityScore,\n  tags: item._enrichment?.tags,\n  timestamp: new Date().toISOString()\n};\n\nconsole.log(JSON.stringify({ event: 'AUDIT_TRAIL', ...auditEntry }));\n\nreturn [{ json: { ...item, _audit: auditEntry } }];"
+      },
+      "id": "node-audit",
+      "name": "📋 Audit Trail Log",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2880, 400],
+      "description": "Writes a structured audit trail entry for every successfully processed lead. Captures final routing decision and enrichment outcome."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// DEAD-LETTER FLOW — PREPARE PAYLOAD\n// ============================================================\nconst item = $input.first().json;\nconst errorContext = item._validation || {};\n\nreturn [{\n  json: {\n    _deadLetter: true,\n    payload: JSON.stringify(item),\n    failureStage: errorContext.stage || 'UNKNOWN',\n    errors: JSON.stringify(errorContext.errors || []),\n    spamFlags: JSON.stringify(errorContext.spamFlags || []),\n    spamScore: errorContext.spamScore || 0,\n    isSpam: errorContext.isSpam || false,\n    email: item.email || 'N/A',\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-dead-letter-prep",
+      "name": "☠️ Dead-Letter: Prepare Payload",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 560],
+      "description": "Prepares a structured dead-letter record from invalid/spam payloads. Captures original payload, failure stage, errors, and spam flags."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $env.GOOGLE_SHEET_ID }}",
+        "sheetName": "DeadLetterQueue",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $json.timestamp }}",
+            "email": "={{ $json.email }}",
+            "failure_stage": "={{ $json.failureStage }}",
+            "errors": "={{ $json.errors }}",
+            "spam_flags": "={{ $json.spamFlags }}",
+            "spam_score": "={{ $json.spamScore }}",
+            "is_spam": "={{ $json.isSpam }}",
+            "raw_payload": "={{ $json.payload }}"
+          }
+        }
+      },
+      "id": "node-dead-letter-store",
+      "name": "💀 Dead-Letter: Store to DLQ Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [1120, 560],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "description": "Appends failed/spam leads to the DeadLetterQueue sheet for manual review, re-processing, or analysis."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 18 * * *"
+            }
+          ]
+        }
+      },
+      "id": "node-cron-digest",
+      "name": "⏰ Cron: Daily Digest at 6PM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 700],
+      "description": "Triggers daily at 18:00 (6PM) server time to compute and send the analytics digest."
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "documentId": "={{ $env.GOOGLE_SHEET_ID }}",
+        "sheetName": "Leads",
+        "options": {}
+      },
+      "id": "node-digest-fetch",
+      "name": "📥 Digest: Fetch All Leads",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [460, 700],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "description": "Fetches all rows from Leads sheet for today's digest computation."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// DAILY ANALYTICS DIGEST COMPUTATION\n// ============================================================\nconst items = $input.all();\nconst today = new Date().toISOString().split('T')[0];\n\n// Filter today's records\nconst todayRecords = items.filter(item => {\n  const processedAt = item.json.processed_at || '';\n  return processedAt.startsWith(today);\n});\n\nconst total = todayRecords.length;\nlet highUrgency = 0, normalUrgency = 0;\nconst byProduct = {};\nconst byStatus = {};\nlet totalPriorityScore = 0;\n\nfor (const r of todayRecords) {\n  const row = r.json;\n  if (row.urgency === 'high') highUrgency++;\n  else normalUrgency++;\n\n  const prod = row.product || 'Unknown';\n  byProduct[prod] = (byProduct[prod] || 0) + 1;\n\n  const status = row.status || 'unknown';\n  byStatus[status] = (byStatus[status] || 0) + 1;\n\n  totalPriorityScore += parseFloat(row.priority_score || 0);\n}\n\nconst avgPriorityScore = total > 0 ? (totalPriorityScore / total).toFixed(1) : 0;\n\n// Top 5 recent leads (already ordered by append time)\nconst top5 = todayRecords.slice(-5).reverse().map(r => ({\n  name: r.json.name,\n  email: r.json.email,\n  company: r.json.company,\n  product: r.json.product,\n  urgency: r.json.urgency,\n  priorityScore: r.json.priority_score\n}));\n\n// Product breakdown sorted\nconst productBreakdown = Object.entries(byProduct)\n  .sort((a, b) => b[1] - a[1])\n  .map(([p, c]) => `  • ${p}: ${c}`)\n  .join('\\n');\n\n// Fetch DLQ count for today\nconst digestData = {\n  date: today,\n  total,\n  highUrgency,\n  normalUrgency,\n  avgPriorityScore,\n  byProduct,\n  byStatus,\n  productBreakdown,\n  top5,\n  generatedAt: new Date().toISOString()\n};\n\nreturn [{ json: digestData }];"
+      },
+      "id": "node-digest-compute",
+      "name": "📊 Digest: Compute Analytics",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 700],
+      "description": "Computes today's lead analytics: counts by urgency, breakdown by product, status distribution, average priority score, top 5 recent leads."
+    },
+    {
+      "parameters": {
+        "webhookUri": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "text": "",
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "header",
+              "text": {
+                "type": "plain_text",
+                "text": "📊 Daily Lead Digest — {{ $json.date }}"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {
+                  "type": "mrkdwn",
+                  "text": "*Total Leads Today:*\n{{ $json.total }}"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*Avg Priority Score:*\n{{ $json.avgPriorityScore }}/100"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*🚨 High Urgency:*\n{{ $json.highUrgency }}"
+                },
+                {
+                  "type": "mrkdwn",
+                  "text": "*🟢 Normal:*\n{{ $json.normalUrgency }}"
+                }
+              ]
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*Leads by Product:*\n{{ $json.productBreakdown }}"
+              }
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*Top 5 Recent Leads:*\n{{ $json.top5.map((l, i) => `${i+1}. ${l.name} (${l.company}) — ${l.product} | Priority: ${l.priorityScore}`).join('\\n') }}"
+              }
+            },
+            {
+              "type": "context",
+              "elements": [
+                {
+                  "type": "mrkdwn",
+                  "text": "Generated at {{ $json.generatedAt }} by Lead Pipeline Automation"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "id": "node-digest-slack",
+      "name": "📢 Digest: Send to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [900, 700],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Slack Webhook"
+        }
+      },
+      "description": "Sends the formatted daily analytics digest to Slack using Block Kit for structured rendering."
+    },
+    {
+      "parameters": {
+        "functionCode": "// ============================================================\n// ERROR HANDLER — DEAD-LETTER FROM RUNTIME FAILURES\n// ============================================================\nconst error = $input.first();\n\nconst dlqEntry = {\n  _deadLetter: true,\n  payload: JSON.stringify(error.json || {}),\n  failureStage: 'RUNTIME_ERROR',\n  errors: JSON.stringify([error.error?.message || 'Unknown runtime error']),\n  spamFlags: '[]',\n  spamScore: 0,\n  isSpam: false,\n  email: error.json?.email || 'N/A',\n  timestamp: new Date().toISOString()\n};\n\nconsole.error(JSON.stringify({ event: 'RUNTIME_ERROR_CAUGHT', ...dlqEntry }));\n\nreturn [{ json: dlqEntry }];"
+      },
+      "id": "node-error-handler",
+      "name": "🚨 Error Handler: Catch Runtime Failures",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 900],
+      "description": "Catches any unhandled runtime errors from the main workflow. Formats them as dead-letter records for DLQ storage."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $env.GOOGLE_SHEET_ID }}",
+        "sheetName": "DeadLetterQueue",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $json.timestamp }}",
+            "email": "={{ $json.email }}",
+            "failure_stage": "={{ $json.failureStage }}",
+            "errors": "={{ $json.errors }}",
+            "spam_flags": "={{ $json.spamFlags }}",
+            "spam_score": "={{ $json.spamScore }}",
+            "is_spam": "={{ $json.isSpam }}",
+            "raw_payload": "={{ $json.payload }}"
+          }
+        }
+      },
+      "id": "node-error-dlq",
+      "name": "💀 Error → DLQ Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [460, 900],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "description": "Persists runtime error records to DeadLetterQueue sheet. Same schema as validation failures for unified DLQ review."
+    }
+  ],
+  "connections": {
+    "🔗 Webhook: Lead Intake": {
+      "main": [
+        [
+          {
+            "node": "✅ ACK: Immediate 202 Response",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "🛡️ Validate + Spam Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🛡️ Validate + Spam Filter": {
+      "main": [
+        [
+          {
+            "node": "🔀 Route: Valid or Dead-Letter?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Route: Valid or Dead-Letter?": {
+      "main": [
+        [
+          {
+            "node": "🔑 Generate Idempotency Hash",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "☠️ Dead-Letter: Prepare Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔑 Generate Idempotency Hash": {
+      "main": [
+        [
+          {
+            "node": "🔍 Check: Already Processed? (Sheets Lookup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Check: Already Processed? (Sheets Lookup)": {
+      "main": [
+        [
+          {
+            "node": "🔀 Route: New Lead or Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Route: New Lead or Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "🧠 Enrich: Company + Priority Score + Tags",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📋 Log: Duplicate Ignored",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🧠 Enrich: Company + Priority Score + Tags": {
+      "main": [
+        [
+          {
+            "node": "📊 Log: Enrichment Observability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Log: Enrichment Observability": {
+      "main": [
+        [
+          {
+            "node": "💾 Store: Google Sheets — Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Store: Google Sheets — Leads": {
+      "main": [
+        [
+          {
+            "node": "🔀 Route: High Urgency or Normal?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Route: High Urgency or Normal?": {
+      "main": [
+        [
+          {
+            "node": "📢 Slack: High Urgency Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📧 Email: Confirmation (Normal Urgency)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📢 Slack: High Urgency Alert": {
+      "main": [
+        [
+          {
+            "node": "🎫 Jira: Create High-Priority Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🎫 Jira: Create High-Priority Ticket": {
+      "main": [
+        [
+          {
+            "node": "📋 Audit Trail Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📧 Email: Confirmation (Normal Urgency)": {
+      "main": [
+        [
+          {
+            "node": "✏️ Update Status: acknowledged",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "✏️ Update Status: acknowledged": {
+      "main": [
+        [
+          {
+            "node": "📋 Audit Trail Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "☠️ Dead-Letter: Prepare Payload": {
+      "main": [
+        [
+          {
+            "node": "💀 Dead-Letter: Store to DLQ Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⏰ Cron: Daily Digest at 6PM": {
+      "main": [
+        [
+          {
+            "node": "📥 Digest: Fetch All Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📥 Digest: Fetch All Leads": {
+      "main": [
+        [
+          {
+            "node": "📊 Digest: Compute Analytics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Digest: Compute Analytics": {
+      "main": [
+        [
+          {
+            "node": "📢 Digest: Send to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🚨 Error Handler: Catch Runtime Failures": {
+      "main": [
+        [
+          {
+            "node": "💀 Error → DLQ Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "node-error-handler"
+  },
+  "staticData": null,
+  "tags": ["lead-pipeline", "production", "support", "automation"],
+  "triggerCount": 2,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}

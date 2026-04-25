@@ -1,0 +1,9 @@
+{
+  "_meta": { "scenario": "HIGH urgency — enterprise lead, production outage" },
+  "name": "Sarah Chen",
+  "email": "sarah.chen@stripe.com",
+  "company": "Stripe",
+  "message": "Our production payment integration is completely down. We are processing zero transactions and losing revenue every minute. This is a critical production outage affecting thousands of merchants. Need immediate assistance from your engineering team.",
+  "urgency": "high",
+  "product": "PaymentSDK"
+}
